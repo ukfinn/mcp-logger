@@ -3,7 +3,7 @@ import asyncio
 import sys
 import json
 from collections import defaultdict, deque
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
