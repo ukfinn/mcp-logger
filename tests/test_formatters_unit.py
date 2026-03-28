@@ -2,7 +2,6 @@
 import json
 from datetime import datetime, timezone
 
-import pytest
 
 from mcp_logger.formatters import to_jsonl, now_utc
 

@@ -1,7 +1,6 @@
 """Tests for metrics module."""
 import json
 import asyncio
-from pathlib import Path
 
 import pytest
 from mcp_logger.metrics import MetricsCollector

@@ -1,5 +1,4 @@
 """Tests for sanitizer module."""
-import pytest
 from mcp_logger.sanitizer import sanitize, _mask_string
 
 

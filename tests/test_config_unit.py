@@ -1,6 +1,5 @@
 """Unit tests for mcp_logger.config.LoggerConfig."""
 import os
-import pytest
 
 from mcp_logger.config import LoggerConfig
 

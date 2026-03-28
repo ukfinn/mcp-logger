@@ -1,6 +1,5 @@
 """Tests for rotation module."""
 import gzip
-import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -26,7 +25,7 @@ def test_current_log_path_includes_date(rotator):
 
 
 def test_directory_created(tmp_path):
-    r = LogRotator(log_dir=str(tmp_path), service_name="new-svc")
+    LogRotator(log_dir=str(tmp_path), service_name="new-svc")
     assert (tmp_path / "new-svc").exists()
 
 
