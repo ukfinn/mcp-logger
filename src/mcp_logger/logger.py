@@ -1,6 +1,14 @@
-"""Core MCPLogger class — writes JSONL audit logs."""
+"""Core MCPLogger class — writes JSONL audit logs.
+
+Writes go through an in-process ``asyncio.Queue`` consumed by a single
+worker task so call-sites inside async handlers never block on file I/O.
+When no event loop is running (tests, CLI scripts), we fall back to a
+synchronous write so logs are still captured.
+"""
+import asyncio
 import json
 import sys
+import threading
 import uuid
 from typing import Any
 
@@ -9,6 +17,11 @@ from .formatters import to_jsonl, now_utc
 from .rotation import LogRotator
 from .sanitizer import sanitize
 from .metrics import MetricsCollector
+
+# Drop log records rather than blocking a request if the writer is wedged.
+# Set high enough that realistic workloads never hit it; rely on the worker
+# running at ~disk-write speed.
+_QUEUE_MAX = 10_000
 
 
 class MCPLogger:
@@ -41,6 +54,16 @@ class MCPLogger:
             log_dir=self.log_dir,
             dump_interval=cfg.metrics_dump_interval,
         )
+
+        # Async-write plumbing. The queue is lazily bound to whatever event
+        # loop we run the worker on — see ``start_writer()``/``stop_writer``.
+        self._queue: asyncio.Queue | None = None
+        self._writer_task: asyncio.Task | None = None
+        self._writer_loop: asyncio.AbstractEventLoop | None = None
+        self._dropped: int = 0
+        # Serialize the sync-fallback path so two threads don't interleave
+        # bytes inside a single JSONL line.
+        self._sync_lock = threading.Lock()
 
     def log_api_request(
         self,
@@ -292,11 +315,102 @@ class MCPLogger:
         }
         return record
 
-    def _write(self, record: dict) -> None:
-        log_path = self._rotator.current_log_path()
-        line = to_jsonl(record)
+    # ------------------------------------------------------------------
+    # Async writer lifecycle
+    # ------------------------------------------------------------------
+
+    async def start_writer(self) -> None:
+        """Start the background writer task bound to the current loop.
+
+        Safe to call multiple times; a second call is a no-op while a
+        writer is already running.
+        """
+        if self._writer_task is not None and not self._writer_task.done():
+            return
+        loop = asyncio.get_running_loop()
+        self._writer_loop = loop
+        self._queue = asyncio.Queue(maxsize=_QUEUE_MAX)
+        self._writer_task = loop.create_task(self._writer_loop_fn())
+
+    async def stop_writer(self) -> None:
+        """Flush queued records and stop the writer task."""
+        if self._writer_task is None:
+            return
+        # Sentinel ``None`` tells the worker to drain and exit.
+        if self._queue is not None:
+            await self._queue.put(None)
         try:
-            with open(log_path, "a", encoding="utf-8") as f:
+            await self._writer_task
+        except asyncio.CancelledError:
+            pass
+        self._writer_task = None
+        self._writer_loop = None
+        self._queue = None
+
+    async def _writer_loop_fn(self) -> None:
+        assert self._queue is not None
+        while True:
+            item = await self._queue.get()
+            if item is None:
+                # Drain anything still queued, then exit.
+                pending: list[tuple[str, str]] = []
+                while not self._queue.empty():
+                    nxt = self._queue.get_nowait()
+                    if nxt is None:
+                        continue
+                    pending.append(nxt)
+                for path, line in pending:
+                    await asyncio.to_thread(self._blocking_write, path, line)
+                return
+            path, line = item
+            await asyncio.to_thread(self._blocking_write, path, line)
+
+    @staticmethod
+    def _blocking_write(path: str, line: str) -> None:
+        try:
+            with open(path, "a", encoding="utf-8") as f:
                 f.write(line)
         except OSError as e:
             print(f"MCPLogger: failed to write log: {e}", file=sys.stderr)
+
+    def _write(self, record: dict) -> None:
+        """Enqueue a record for the async writer.
+
+        Falls back to a synchronous write when no writer is running (unit
+        tests, CLI scripts). In production the server starts the writer in
+        its FastAPI lifespan, so the fallback path never executes.
+        """
+        log_path = str(self._rotator.current_log_path())
+        line = to_jsonl(record)
+
+        queue = self._queue
+        loop = self._writer_loop
+        if queue is not None and loop is not None and loop.is_running():
+            try:
+                # Thread-safe: callers are coroutines on ``loop`` OR other
+                # threads invoking logging from sync code. ``call_soon_threadsafe``
+                # dispatches the put onto the writer loop.
+                loop.call_soon_threadsafe(self._enqueue_nowait, queue, log_path, line)
+                return
+            except RuntimeError:
+                # Loop died between the check and the call — fall through
+                # to the sync path.
+                pass
+
+        with self._sync_lock:
+            self._blocking_write(log_path, line)
+
+    def _enqueue_nowait(
+        self, queue: asyncio.Queue, path: str, line: str
+    ) -> None:
+        try:
+            queue.put_nowait((path, line))
+        except asyncio.QueueFull:
+            # Drop rather than block the request path. Surface the count so
+            # ops can see under-provisioned logging.
+            self._dropped += 1
+            if self._dropped % 1000 == 1:
+                print(
+                    f"MCPLogger: log queue full — dropped {self._dropped} records",
+                    file=sys.stderr,
+                )
