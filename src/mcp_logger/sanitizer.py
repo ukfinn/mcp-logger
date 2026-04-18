@@ -5,6 +5,11 @@ from typing import Any
 
 _BEARER_RE = re.compile(r"(Bearer\s+|OAuth\s+)([a-zA-Z0-9_\-\.]{4})[a-zA-Z0-9_\-\.]{13,}([a-zA-Z0-9_\-\.]{3})")
 _B24_WEBHOOK_RE = re.compile(r"(/rest/\d+/)([a-zA-Z0-9]{4})[a-zA-Z0-9]{8,}([a-zA-Z0-9]{3})(/)")
+# Yandex OAuth tokens look like ``y0_AgAAAABp...`` — 60+ chars of [A-Za-z0-9_-]
+# after the literal prefix. The existing _BEARER_RE only fires on "Bearer "
+# or "OAuth " prefixes, so a bare y0_ value pasted into a request body or
+# response JSON would slip through. P3-001 from the 2026-04-18 security audit.
+_YANDEX_TOKEN_RE = re.compile(r"(y0_[A-Za-z0-9_\-]{4})[A-Za-z0-9_\-]{16,}([A-Za-z0-9_\-]{3})")
 
 
 def _mask_string(value: str) -> str:
@@ -19,6 +24,9 @@ def _mask_value(value: str) -> str:
     value = _BEARER_RE.sub(lambda m: m.group(1) + m.group(2) + "****" + m.group(3), value)
     value = _B24_WEBHOOK_RE.sub(
         lambda m: m.group(1) + m.group(2) + "****" + m.group(3) + m.group(4), value
+    )
+    value = _YANDEX_TOKEN_RE.sub(
+        lambda m: m.group(1) + "****" + m.group(2), value
     )
     return value
 
